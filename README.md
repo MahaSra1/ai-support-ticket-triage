@@ -13,12 +13,13 @@ Turns messy customer messages about parcels and online orders into **structured 
 {
   "customer_name": "Priya",
   "tracking_number": "33LPX2049881",
-  "issue_type": "late_delivery",
+  "issues": ["late_delivery"],
   "deadline_mentioned": true,
   "customer_upset": true,
   "problem_with_order": true,
   "sentiment": "negative",
-  "summary": "Parcel late, needed by Saturday for a birthday gift."
+  "summary": "Parcel late, needed by Saturday for a birthday gift.",
+  "issue_type": "late_delivery"
 }
 ```
 **→ Urgency: high · Escalated to Delivery Operations · respond within 4h**
@@ -28,12 +29,16 @@ Turns messy customer messages about parcels and online orders into **structured 
 ## ✨ Features
 
 - **LLM extraction** with a local model (Mistral 7B via Ollama) — no paid API, data stays on the machine
+- **Multi-issue tickets**: the LLM lists *every* issue; a fixed priority rule picks the primary one and the other teams are notified
+- **`unclear` handling**: gibberish is kept at L1 with "ask the customer for details" instead of an invented summary
+- **Production-style LLM client** (`llm_client.py`): timeouts, retry with exponential backoff on network/5xx errors only, friendly errors (`ollama pull <model>`), `keep_alive` to avoid cold starts
+- **Latency and token metrics** in the UI: prompt/output tokens, tokens/sec, total time, cold-start warning
 - **Structured output**: JSON-schema mode (constrained decoding) generated from a Pydantic model
 - **Two-step validation** (`json.loads` → Pydantic) with an **automatic retry loop** that feeds the error back to the model
 - **Regex fallback** for tracking numbers the model misses
 - **Deterministic urgency and routing rules** — the LLM extracts facts, code makes decisions
-- **16 unit tests** that run without the LLM (mocked with `monkeypatch`), plus GitHub Actions CI
-- Clean separation: `extractor.py` (logic) · `app.py` (UI) · `test_extractor.py` (tests)
+- **30 unit tests** that run without the LLM (mocked with `monkeypatch`), plus GitHub Actions CI
+- Clean separation: `llm_client.py` (model access) · `extractor.py` (logic) · `app.py` (UI) · `test_*.py` (tests)
 
 ## 🖼️ Screenshots
 
@@ -46,15 +51,16 @@ Turns messy customer messages about parcels and online orders into **structured 
 ```mermaid
 flowchart TD
     A[Customer message] --> B[Build messages<br/>system rules + few-shot examples]
-    B --> C[call_llm → Ollama / Mistral<br/>JSON-schema mode]
+    B --> C[LLMClient.chat → Ollama / Mistral<br/>JSON-schema mode · temperature 0<br/>timeouts + retries on network errors]
     C --> D{json.loads OK?}
     D -- no --> R[Retry: show model its answer + error<br/>max 2 retries]
     D -- yes --> E{Pydantic Ticket valid?}
     E -- no --> R
     R --> C
     E -- yes --> F[Regex fallback<br/>fill missing tracking number]
-    F --> G[compute_urgency<br/>rules]
-    G --> H[route_ticket<br/>L1 or team + SLA]
+    F --> P[Primary issue<br/>priority rule]
+    P --> G[compute_urgency<br/>rules]
+    G --> H[route_ticket<br/>L1 or team + SLA + also notify]
     H --> I[Streamlit UI]
 ```
 
@@ -62,7 +68,8 @@ flowchart TD
 
 | Job | Done by | Why |
 |---|---|---|
-| Understand the message (issue, signals, tone, summary) | **LLM** | Needs language understanding |
+| Understand the message (all issues, signals, tone, summary) | **LLM** | Needs language understanding |
+| Primary issue when there are several | **Rules** (`ISSUE_PRIORITY`) | The cause beats the request: *damaged + refund → damaged* |
 | Tracking number (if missed) | **Regex** | Fixed pattern — reliable, fast, free |
 | Format + allowed values | **Pydantic** | Strict, typed validation |
 | Urgency | **Rules** | Stable, explainable, testable |
@@ -76,7 +83,9 @@ flowchart TD
 | only `problem_with_order` | medium | 24h |
 | none | low | 72h |
 
-Escalate to a team if urgency is **high** or the issue is **damaged / lost / refund**; otherwise **L1 Customer Support**.
+Primary issue priority: `damaged > lost > wrong_address > late_delivery > refund > other > unclear`.
+
+Escalate to a team if urgency is **high** or the primary issue is **damaged / lost / refund**; otherwise **L1 Customer Support**. Teams for any other issues go in `also_notify`. `unclear` messages always stay at L1 with the next action "ask the customer for more details".
 
 | Issue type | Team (when escalated) |
 |---|---|
@@ -86,6 +95,7 @@ Escalate to a team if urgency is **high** or the issue is **damaged / lost / ref
 | wrong_address | Address & Redirection |
 | refund | Customer Payments |
 | other | General Enquiries |
+| unclear | L1 Customer Support |
 
 *Team names are examples and can be changed in `TEAM_FOR_ISSUE`.*
 
@@ -102,7 +112,7 @@ python -m venv venv
 # macOS/Linux:  source venv/bin/activate
 
 pip install -r requirements.txt
-ollama pull mistral
+ollama pull mistral        # 16 GB RAM; on 8 GB use: ollama pull llama3.2:3b
 
 python -m streamlit run app.py          # opens http://localhost:8501
 ```
@@ -130,6 +140,9 @@ The LLM call is replaced with a fake (`monkeypatch`), so tests run in under a se
 | Regex | fills a missed tracking number; never invents one |
 | Urgency | high (deadline / upset), medium (problem only), low |
 | Routing | damaged → Claims & Damages; high → 4h SLA; simple question → L1 |
+| Multi-issue | cause beats request; duplicates removed; second team notified; `issue_type` not in the LLM schema |
+| Unclear | gibberish stays at L1, low urgency, asks for details |
+| LLM client | metrics maths, `options` payload, 404 → pull hint, retries 5xx, never retries 4xx, Ollama-down message |
 
 ## 🔧 Challenges I solved
 
@@ -141,6 +154,11 @@ The LLM call is replaced with a fake (`monkeypatch`), so tests run in under a se
 | Vague messages rated **high urgency** | Few-shot examples | Prompt engineering |
 | Urgency **changed when the same question was reworded** | Redesign: LLM extracts yes/no facts, **rules compute urgency** | Facts vs decisions |
 | `NameError` in the UI after adding routing | Moved import to the top of the file | Debugging / PEP 8 |
+| Mistral and Llama 3.2 3B **disagreed** on "box crushed, I want my money back" (damaged vs refund) | LLM lists all issues; a **priority rule** picks the primary | Facts vs decisions |
+| "Late AND I moved house" lost the *late* part (only one issue allowed) | `issues` list + `also_notify` teams | Schema design |
+| Gibberish produced **valid JSON with an invented summary** | `unclear` issue + few-shot example + "only describe what the customer wrote" | Valid ≠ correct |
+| Raw `requests.post` had no retry, hung on slow CPU, and showed raw stack traces | `LLMClient` with timeouts, backoff and friendly errors | Production engineering |
+| 64 s waits on first call (cold start); 0.7 tok/s on an 8 GB laptop | `keep_alive`, metrics in UI, smaller model option | Latency measurement |
 
 **Key lesson:** valid output is not the same as correct output. Validation catches format errors; meaning errors need clear prompts, examples, deterministic rules and evaluation.
 
@@ -148,6 +166,7 @@ The LLM call is replaced with a fake (`monkeypatch`), so tests run in under a se
 
 - The tracking-number regex is generic and can match words like `SATURDAY2024`; production would use each carrier's exact format.
 - Sentiment and `customer_upset` are still LLM judgements and can be inconsistent on short messages.
+- The LLM can still miss an issue in a long message; the priority rule only helps once issues are listed.
 - No evaluation set yet — accuracy is checked manually on sample messages.
 - Single message at a time; no batch processing.
 
@@ -173,7 +192,7 @@ The LLM call is replaced with a fake (`monkeypatch`), so tests run in under a se
 
 ## 🧰 Tech stack
 
-Python · Ollama · Mistral 7B · Pydantic v2 · Streamlit · Requests · Regex · Pytest · GitHub Actions
+Python · Ollama (REST API) · Mistral 7B / Llama 3.2 3B · Pydantic v2 · Streamlit · Requests · Regex · Pytest · GitHub Actions
 
 ## 👩‍💻 Author
 
